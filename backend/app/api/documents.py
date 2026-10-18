@@ -1,16 +1,41 @@
+from typing import BinaryIO
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.database import get_db
 from app.documents.service import create_document, delete_document, get_owned_document, list_documents, retry_document
 from app.models import User
 from app.runtime import get_queue, get_storage, get_vectors
-from app.config import get_settings
 from app.schemas import DocumentOut
 from app.security import get_current_user
 
 router = APIRouter(prefix="/api/workspaces/{workspace_id}/documents", tags=["documents"])
+_UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _read_upload_with_limit(stream: BinaryIO, max_bytes: int) -> bytes:
+    data = bytearray()
+    if max_bytes < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"PDF exceeds size limit of {max_bytes} bytes",
+        )
+
+    while True:
+        remaining = max_bytes - len(data)
+        chunk = stream.read(min(_UPLOAD_READ_CHUNK_BYTES, remaining + 1))
+        if not chunk:
+            return bytes(data)
+        if len(chunk) > remaining:
+            data.clear()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"PDF exceeds size limit of {max_bytes} bytes",
+            )
+        data.extend(chunk)
 
 
 @router.get("", response_model=list[DocumentOut])
@@ -29,19 +54,23 @@ def post_document(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> DocumentOut:
-    data = file.file.read()
-    filename = file.filename or "upload.pdf"
-    doc = create_document(
-        db,
-        user,
-        workspace_id,
-        filename,
-        data,
-        get_settings(),
-        get_storage(),
-        get_queue(),
-    )
-    return DocumentOut.model_validate(doc)
+    try:
+        settings = get_settings()
+        data = _read_upload_with_limit(file.file, settings.max_pdf_bytes)
+        filename = file.filename or "upload.pdf"
+        doc = create_document(
+            db,
+            user,
+            workspace_id,
+            filename,
+            data,
+            settings,
+            get_storage(),
+            get_queue(),
+        )
+        return DocumentOut.model_validate(doc)
+    finally:
+        file.file.close()
 
 
 @router.post("/{document_id}/retry", response_model=DocumentOut)

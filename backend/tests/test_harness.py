@@ -1,14 +1,67 @@
 import io
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.api import documents as documents_api
+from app.config import Settings
 from app.citations.validator import validate_model_output
 from app.models import Document, User, Workspace
 from app.parsing.chunking import chunk_pages
 from app.parsing.pdf import PageText, PdfValidationError, parse_pdf, validate_pdf_bytes
 from app.retrieval.embeddings import HashEmbeddingService
 from app.retrieval.qdrant_store import MemoryVectorStore, RetrievedChunk
+
+
+class RecordingStorage:
+    def __init__(self) -> None:
+        self.put_calls: list[tuple[str, bytes, str]] = []
+
+    def put(self, key: str, data: bytes, content_type: str = "application/pdf") -> None:
+        self.put_calls.append((key, data, content_type))
+
+
+class RecordingQueue:
+    def __init__(self) -> None:
+        self.document_ids: list[str] = []
+
+    def enqueue_ingest(self, document_id: str) -> None:
+        self.document_ids.append(document_id)
+
+
+def _configure_upload_dependencies(monkeypatch: pytest.MonkeyPatch, max_bytes: int):
+    storage = RecordingStorage()
+    queue = RecordingQueue()
+    monkeypatch.setattr(documents_api, "get_settings", lambda: Settings(max_pdf_bytes=max_bytes))
+    monkeypatch.setattr(documents_api, "get_storage", lambda: storage)
+    monkeypatch.setattr(documents_api, "get_queue", lambda: queue)
+    return storage, queue
+
+
+def _create_authenticated_workspace(client: TestClient) -> tuple[str, dict[str, str]]:
+    signup = client.post(
+        "/api/auth/signup",
+        json={"email": "upload-researcher@lab.org", "password": "StrongPassword999!"},
+    )
+    assert signup.status_code == 200
+    headers = {"Authorization": f"Bearer {signup.json()['access_token']}"}
+    workspace = client.post("/api/workspaces", json={"name": "Upload test"}, headers=headers)
+    assert workspace.status_code == 200
+    return workspace.json()["id"], headers
+
+
+class TrackingStream(io.BytesIO):
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.read_sizes: list[int] = []
+        self.bytes_returned = 0
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        chunk = super().read(size)
+        self.bytes_returned += len(chunk)
+        return chunk
 
 
 def test_health_check(client: TestClient) -> None:
@@ -86,6 +139,96 @@ def test_pdf_validation_rejections(pdf_generator) -> None:
     multi_page_pdf = pdf_generator(pages=5)
     with pytest.raises(PdfValidationError, match="exceeds page limit"):
         validate_pdf_bytes(multi_page_pdf, "paper.pdf", max_bytes=10_000_000, max_pages=2)
+
+
+def test_read_upload_with_limit_reads_incrementally_and_stops_after_one_excess_byte() -> None:
+    stream = TrackingStream(b"x" * (128 * 1024 + 1))
+
+    with pytest.raises(HTTPException, match="PDF exceeds size limit of 128000 bytes"):
+        documents_api._read_upload_with_limit(stream, 128_000)
+
+    assert stream.bytes_returned == 128_001
+    assert all(0 < size <= documents_api._UPLOAD_READ_CHUNK_BYTES for size in stream.read_sizes)
+
+
+def test_upload_pdf_below_size_limit_preserves_upload_behavior(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    pdf_generator,
+) -> None:
+    pdf_bytes = pdf_generator()
+    storage, queue = _configure_upload_dependencies(monkeypatch, len(pdf_bytes) + 1)
+    workspace_id, headers = _create_authenticated_workspace(client)
+
+    response = client.post(
+        f"/api/workspaces/{workspace_id}/documents",
+        headers=headers,
+        files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert storage.put_calls[0][1] == pdf_bytes
+    assert queue.document_ids == [response.json()["id"]]
+
+
+def test_upload_pdf_exactly_at_size_limit_is_accepted(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    pdf_generator,
+) -> None:
+    pdf_bytes = pdf_generator()
+    storage, queue = _configure_upload_dependencies(monkeypatch, len(pdf_bytes))
+    workspace_id, headers = _create_authenticated_workspace(client)
+
+    response = client.post(
+        f"/api/workspaces/{workspace_id}/documents",
+        headers=headers,
+        files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert storage.put_calls[0][1] == pdf_bytes
+    assert queue.document_ids == [response.json()["id"]]
+
+
+def test_upload_pdf_over_limit_by_one_byte_stops_before_storage_and_queue(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    pdf_generator,
+) -> None:
+    pdf_bytes = pdf_generator()
+    storage, queue = _configure_upload_dependencies(monkeypatch, len(pdf_bytes) - 1)
+    workspace_id, headers = _create_authenticated_workspace(client)
+
+    response = client.post(
+        f"/api/workspaces/{workspace_id}/documents",
+        headers=headers,
+        files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == f"PDF exceeds size limit of {len(pdf_bytes) - 1} bytes"
+    assert storage.put_calls == []
+    assert queue.document_ids == []
+
+
+def test_upload_invalid_pdf_keeps_existing_validation_response(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, queue = _configure_upload_dependencies(monkeypatch, 1024)
+    workspace_id, headers = _create_authenticated_workspace(client)
+
+    response = client.post(
+        f"/api/workspaces/{workspace_id}/documents",
+        headers=headers,
+        files={"file": ("paper.pdf", b"NOT_A_PDF_FILE", "application/pdf")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "File is not a valid PDF"
+    assert storage.put_calls == []
+    assert queue.document_ids == []
 
 
 def test_scanned_pdf_flagging(pdf_generator) -> None:
