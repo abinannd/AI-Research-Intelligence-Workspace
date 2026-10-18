@@ -3,6 +3,7 @@
 import { useEffect, useState, type ChangeEvent, type FormEvent } from "react";
 
 import { api } from "@/lib/api";
+import WorkspaceAsk from "@/components/WorkspaceAsk";
 import { validatePdfUpload } from "@/lib/documentUpload";
 import { IN_FLIGHT_STATUSES, statusHelp, statusLabel } from "@/lib/status";
 import type { DocumentStatus, WorkspaceDocument } from "@/lib/types";
@@ -256,6 +257,14 @@ export default function WorkspaceDocuments({ workspaceId }: { workspaceId: strin
           </p>
         )}
       </div>
+      <WorkspaceAsk
+        documentsError={documentsError !== null}
+        documentsLoading={loading || refreshing}
+        readyDocumentIds={documents
+          .filter((document) => document.status === "ready")
+          .map((document) => document.id)}
+        workspaceId={workspaceId}
+      />
     </section>
   );
 }

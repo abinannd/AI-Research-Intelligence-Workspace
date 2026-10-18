@@ -2,7 +2,7 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 
-import { api } from "@/lib/api";
+import { api, setUnauthorizedHandler } from "@/lib/api";
 import { getAccessToken, setAccessToken } from "@/lib/token";
 import WorkspaceDocuments from "@/components/WorkspaceDocuments";
 import type { User, Workspace } from "@/lib/types";
@@ -32,6 +32,16 @@ export default function Home() {
   const [createPending, setCreatePending] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setUser(null);
+      setWorkspaces([]);
+      setSelectedWorkspaceId(null);
+      setAuthError("Your session has expired. Please sign in again.");
+    });
+    return () => setUnauthorizedHandler(null);
+  }, []);
 
   useEffect(() => {
     let active = true;

@@ -44,7 +44,7 @@ export interface Citation {
   id: string;
   claim_id: string | null;
   index: number;
-  document_id: string;
+  document_id: string | null;
   filename: string;
   page_number: number;
   chunk_id: string | null;
