@@ -1,0 +1,32 @@
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:15432:5432"
+
+  redis:
+    ports: !override
+      - "127.0.0.1:16379:6379"
+
+  qdrant:
+    ports: !override
+      - "127.0.0.1:16333:6333"
+
+  minio:
+    ports: !override
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+
+  api:
+    ports: !override
+      - "127.0.0.1:18000:8000"
+    environment:
+      CORS_ORIGINS: "http://127.0.0.1:3100"
+      MINIO_BUCKET: "ari-task07-20261018-2030"
+      QDRANT_COLLECTION: "ari_task07_20261018_2030"
+      LLM_MODEL: "HuggingFaceTB/SmolLM2-135M-Instruct"
+
+  worker:
+    environment:
+      MINIO_BUCKET: "ari-task07-20261018-2030"
+      QDRANT_COLLECTION: "ari_task07_20261018_2030"
+      LLM_MODEL: "HuggingFaceTB/SmolLM2-135M-Instruct"
