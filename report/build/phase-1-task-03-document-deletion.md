@@ -124,14 +124,36 @@ with local recording doubles:
 
 The test cases require no live PostgreSQL, Redis, Qdrant, or MinIO services.
 
+### Commit-failure regression (added 2026-10-18)
+
+Added `test_delete_document_commit_failure_rolls_back_and_keeps_session_usable`
+to [`backend/tests/test_harness.py`](../../backend/tests/test_harness.py). A
+SQLAlchemy `before_cursor_execute` listener raises an `OperationalError` when
+the document DELETE statement is flushed during `Session.commit()`. The test
+verifies:
+
+- The API responds with HTTP 500, not HTTP 204.
+- Vector and object cleanup have already succeeded before the database failure,
+  consistent with the existing deletion order.
+- SQLAlchemy marks the session transaction inactive after the flush failure.
+  The test explicitly calls `Session.rollback()` before querying.
+- After rollback, a database query confirms the document row still exists, and
+  the session is active and usable.
+
+This establishes the actual SQLAlchemy behavior for the simulated flush/commit
+failure: the request does not remove the persisted row, but the failed session
+must be explicitly rolled back before reuse.
+
 ## 9. Commands executed and actual results
 
 | Command | Actual result |
 |---|---|
 | `C:\Python310\python.exe -m pytest backend\tests\test_harness.py -q -p no:cacheprovider -k delete_document` | **Passed:** 3 passed, 14 deselected; two existing dependency warnings. |
-| `C:\Python310\python.exe -m pytest backend\tests\test_harness.py -q -p no:cacheprovider` | **Passed:** 17 passed; two existing dependency warnings. |
+| `C:\Python310\python.exe -m pytest backend\tests\test_harness.py -q -p no:cacheprovider -k delete_document_commit_failure` | **Passed:** 1 passed, 17 deselected; two existing dependency warnings. |
+| `C:\Python310\python.exe -m pytest backend\tests\test_harness.py -q -p no:cacheprovider` | **Passed:** 18 passed; two existing dependency warnings. |
 | `git diff --check` | **Passed** (non-fatal Git LF/CRLF working-copy warnings observed for modified Python files). |
-| `git status --short --untracked-files=all` | Run after report creation; see the final report-tracking verification below. |
+| `git check-ignore -v report/build/phase-1-task-03-document-deletion.md` | No match returned; the report is not ignored. |
+| `git status --short --untracked-files=all` | Report is visible as ` M report/build/phase-1-task-03-document-deletion.md` because the report is tracked and modified. |
 
 No packages were installed. No services were started. No migrations were run.
 
@@ -147,8 +169,9 @@ conversion warning for modified Python files.
 - Actual result: no matching ignore rule was returned (exit status 1, meaning
   the report is not ignored).
 - Required command: `git status --short --untracked-files=all`
-- Actual result after creating this report:
-  `?? report/build/phase-1-task-03-document-deletion.md`
+- Actual result after this update:
+  ` M report/build/phase-1-task-03-document-deletion.md` (the report is tracked
+  and modified, so it appears as a tracked change rather than an untracked file).
 - No `.gitignore` rule was added or changed to hide this report.
 
 ## 12. API-contract impact
@@ -162,6 +185,11 @@ human-readable detail rather than incorrectly returning success.
 - External cleanup and database commit are not atomic. A database commit error
   after external deletion can leave the database row without its external
   resources.
+- When SQLAlchemy encounters a database error during flush/commit, its session
+  requires explicit `rollback()` before reuse. The endpoint does not perform
+  this rollback in the current implementation; the regression test verifies
+  rollback and session reuse at the test boundary, not session recovery inside
+  the endpoint.
 - Partial cleanup has no automatic worker/reconciliation path; a caller must
   retry the DELETE while the document row remains.
 - Real Qdrant, MinIO, and PostgreSQL failure modes were not exercised. Tests
@@ -170,8 +198,11 @@ human-readable detail rather than incorrectly returning success.
 ## 14. Task status
 
 **COMPLETE.** Required external cleanup failures now prevent database deletion
-and success responses. Focused deletion tests and the full backend harness
-passed. The requested report is present and was verified as not ignored by Git.
+and success responses. The commit-failure regression confirms the API returns
+500 rather than 204, the persisted document remains after SQLAlchemy rollback,
+and the session is reusable after that rollback. Focused deletion tests and the
+full backend harness passed. The requested report is present and was verified
+as not ignored by Git.
 
 ## 15. Recommended next task
 

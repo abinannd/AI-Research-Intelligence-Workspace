@@ -102,7 +102,7 @@ def auth_user(db_session: Session) -> tuple[User, str, dict[str, str]]:
     db_session.commit()
     db_session.refresh(user)
 
-    token = create_access_token({"sub": user.id})
+    token = create_access_token(user.id)
     headers = {"Authorization": f"Bearer {token}"}
     return user, token, headers
 

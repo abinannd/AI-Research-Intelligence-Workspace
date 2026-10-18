@@ -152,6 +152,143 @@ def test_auth_signup_and_me(client: TestClient) -> None:
     assert me_res.json()["email"] == "new_researcher@lab.org"
 
 
+def test_protected_api_rejects_missing_and_invalid_credentials(client: TestClient) -> None:
+    missing = client.get("/api/workspaces")
+    malformed = client.get("/api/workspaces", headers={"Authorization": "Basic invalid"})
+    invalid_token = client.get("/api/workspaces", headers={"Authorization": "Bearer invalid"})
+
+    assert missing.status_code == 403
+    assert malformed.status_code == 403
+    assert invalid_token.status_code == 401
+    assert invalid_token.json()["detail"] == "Invalid token"
+
+
+def test_fixture_authenticates_user_and_allows_owned_workspace(
+    client: TestClient,
+    auth_user: tuple[User, str, dict[str, str]],
+    test_workspace: Workspace,
+) -> None:
+    user, _, headers = auth_user
+
+    me = client.get("/api/auth/me", headers=headers)
+    workspace = client.get(f"/api/workspaces/{test_workspace.id}", headers=headers)
+    workspaces = client.get("/api/workspaces", headers=headers)
+
+    assert me.status_code == 200
+    assert me.json()["id"] == user.id
+    assert workspace.status_code == 200
+    assert workspace.json()["id"] == test_workspace.id
+    assert [item["id"] for item in workspaces.json()] == [test_workspace.id]
+
+
+def test_user_cannot_access_or_mutate_another_users_workspace_or_documents(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_user: tuple[User, str, dict[str, str]],
+    test_workspace: Workspace,
+) -> None:
+    _, _, headers_a = auth_user
+    own_document = Document(
+        workspace_id=test_workspace.id,
+        filename="own-paper.pdf",
+        status="ready",
+        storage_key=f"{test_workspace.id}/own-paper.pdf",
+    )
+    db_session.add(own_document)
+    db_session.commit()
+
+    signup_b = client.post(
+        "/api/auth/signup",
+        json={"email": "second-owner@lab.org", "password": "AnotherStrongPass123!"},
+    )
+    assert signup_b.status_code == 200
+    headers_b = {"Authorization": f"Bearer {signup_b.json()['access_token']}"}
+    workspace_b_response = client.post(
+        "/api/workspaces",
+        json={"name": "Second user's workspace"},
+        headers=headers_b,
+    )
+    assert workspace_b_response.status_code == 200
+    workspace_b_id = workspace_b_response.json()["id"]
+    workspace_b = db_session.get(Workspace, workspace_b_id)
+    assert workspace_b is not None
+    document_b = Document(
+        workspace_id=workspace_b_id,
+        filename="private-paper.pdf",
+        status="ready",
+        storage_key=f"{workspace_b_id}/private-paper.pdf",
+    )
+    db_session.add(document_b)
+    db_session.commit()
+    document_b_id = document_b.id
+
+    storage = RecordingDeleteStorage()
+    vectors = RecordingDeleteVectors()
+    monkeypatch.setattr(documents_api, "get_storage", lambda: storage)
+    monkeypatch.setattr(documents_api, "get_vectors", lambda: vectors)
+
+    own_workspace = client.get(f"/api/workspaces/{test_workspace.id}", headers=headers_a)
+    own_documents = client.get(
+        f"/api/workspaces/{test_workspace.id}/documents",
+        headers=headers_a,
+    )
+    denied_workspace = client.get(f"/api/workspaces/{workspace_b_id}", headers=headers_a)
+    denied_documents = client.get(
+        f"/api/workspaces/{workspace_b_id}/documents",
+        headers=headers_a,
+    )
+    denied_file = client.get(
+        f"/api/workspaces/{workspace_b_id}/documents/{document_b_id}/file",
+        headers=headers_a,
+    )
+    denied_delete = client.delete(
+        f"/api/workspaces/{workspace_b_id}/documents/{document_b_id}",
+        headers=headers_a,
+    )
+    denied_ask = client.post(
+        f"/api/workspaces/{workspace_b_id}/ask",
+        headers=headers_a,
+        json={"question": "Summarize the private paper"},
+    )
+
+    assert own_workspace.status_code == 200
+    assert own_documents.status_code == 200
+    assert [item["id"] for item in own_documents.json()] == [own_document.id]
+    assert denied_workspace.status_code == 404
+    assert denied_documents.status_code == 404
+    assert denied_file.status_code == 404
+    assert denied_delete.status_code == 404
+    assert denied_ask.status_code == 404
+
+    assert db_session.get(Workspace, workspace_b_id) is not None
+    assert db_session.get(Document, document_b_id) is not None
+    assert db_session.query(Document).filter(Document.workspace_id == workspace_b_id).count() == 1
+    assert storage.deleted_keys == []
+    assert vectors.deleted_documents == []
+
+
+def test_authenticated_api_validates_missing_fields_and_nonexistent_ids(
+    client: TestClient,
+    auth_user: tuple[User, str, dict[str, str]],
+) -> None:
+    _, _, headers = auth_user
+
+    missing_workspace_name = client.post("/api/workspaces", json={}, headers=headers)
+    nonexistent_workspace = client.get(
+        "/api/workspaces/does-not-exist",
+        headers=headers,
+    )
+    nonexistent_document = client.get(
+        "/api/workspaces/does-not-exist/documents/does-not-exist/file",
+        headers=headers,
+    )
+
+    assert missing_workspace_name.status_code == 422
+    assert nonexistent_workspace.status_code == 404
+    assert nonexistent_document.status_code == 404
+
+
 def test_pdf_generator_and_parsing(pdf_generator) -> None:
     """Verifies the in-memory PDF generator creates valid multi-page PDFs readable by PyMuPDF."""
     pdf_bytes = pdf_generator(pages=3, title="Neural Graph Attention")
@@ -340,7 +477,7 @@ def test_delete_document_vector_failure_retains_record_and_skips_storage(
 ) -> None:
     storage = RecordingDeleteStorage()
     vectors = RecordingDeleteVectors(fail=True)
-    workspace_id, document_id, headers, _, storage, vectors = _create_document_for_delete(
+    workspace_id, document_id, headers, doc, storage, vectors = _create_document_for_delete(
         client,
         db_session,
         monkeypatch,
@@ -365,9 +502,10 @@ def test_delete_document_commit_failure_rolls_back_and_keeps_session_usable(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workspace_id, document_id, headers, _, storage, vectors = _create_document_for_delete(
+    workspace_id, document_id, headers, doc, storage, vectors = _create_document_for_delete(
         client, db_session, monkeypatch
     )
+    storage_key = doc.storage_key
     engine = db_session.get_bind()
 
     def fail_document_delete(
@@ -393,7 +531,7 @@ def test_delete_document_commit_failure_rolls_back_and_keeps_session_usable(
 
     assert response.status_code == 500
     assert vectors.deleted_documents == [(workspace_id, document_id)]
-    assert storage.deleted_keys == [f"{workspace_id}/{document_id}/paper.pdf"]
+    assert storage.deleted_keys == [storage_key]
 
     db_session.rollback()
     assert db_session.is_active
