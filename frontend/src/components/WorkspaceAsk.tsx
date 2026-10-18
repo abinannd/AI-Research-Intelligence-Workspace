@@ -1,10 +1,12 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useCallback, useRef, useState, type FormEvent } from "react";
 
+import WorkspacePdfViewer from "@/components/WorkspacePdfViewer";
 import { ApiError, api } from "@/lib/api";
 import { createAskPayload } from "@/lib/ask";
-import type { AskResponse } from "@/lib/types";
+import { getCitationTarget } from "@/lib/citationNavigation";
+import type { AskResponse, Citation } from "@/lib/types";
 
 interface WorkspaceAskProps {
   workspaceId: string;
@@ -23,9 +25,66 @@ export default function WorkspaceAsk({
   const [response, setResponse] = useState<AskResponse | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
+  const [loadedPdf, setLoadedPdf] = useState<{ documentId: string; blob: Blob } | null>(null);
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [pdfError, setPdfError] = useState<string | null>(null);
+  const pdfRequestId = useRef(0);
+  const viewerRef = useRef<HTMLDivElement>(null);
 
   const payload = createAskPayload(question, readyDocumentIds);
   const disabled = documentsLoading || documentsError || pending || payload === null;
+
+  async function handleCitationClick(citation: Citation) {
+    const target = getCitationTarget(citation);
+    const requestId = ++pdfRequestId.current;
+    setSelectedCitation(citation);
+    setPdfError(null);
+    window.requestAnimationFrame(() =>
+      viewerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
+    );
+    if (!target) {
+      setPdfLoading(false);
+      setPdfError("This citation has no valid document reference, so its PDF cannot be opened.");
+      return;
+    }
+    if (loadedPdf?.documentId === target.documentId) {
+      setPdfLoading(false);
+      return;
+    }
+
+    setPdfLoading(true);
+    try {
+      const blob = await api.getDocumentFile(workspaceId, target.documentId);
+      if (requestId === pdfRequestId.current) {
+        setLoadedPdf({ documentId: target.documentId, blob });
+      }
+    } catch (requestError) {
+      if (requestId === pdfRequestId.current) {
+        if (requestError instanceof ApiError && requestError.status === 404) {
+          setPdfError("The cited PDF is no longer available in this workspace.");
+        } else if (requestError instanceof ApiError && requestError.status === 401) {
+          setPdfError("Your session has expired. Please sign in again.");
+        } else if (requestError instanceof ApiError && requestError.status === 403) {
+          setPdfError("You are not authorized to open this PDF.");
+        } else {
+          setPdfError(
+            requestError instanceof Error ? requestError.message : "Could not load the cited PDF.",
+          );
+        }
+      }
+    } finally {
+      if (requestId === pdfRequestId.current) setPdfLoading(false);
+    }
+  }
+
+  const handleViewerError = useCallback((viewerError: Error) => {
+    setPdfError(viewerError.message);
+  }, []);
+
+  const handleViewerPageChange = useCallback(() => {
+    setPdfError(null);
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -150,18 +209,73 @@ export default function WorkspaceAsk({
               <ol className="mt-2 space-y-3">
                 {response.citations.map((citation) => (
                   <li className="rounded-md border border-slate-200 bg-white p-3" key={citation.id}>
-                    <p className="text-sm font-semibold text-sky-900">
-                      [{citation.index}] {citation.filename} · Page {citation.page_number}
-                    </p>
-                    {citation.heading && (
-                      <p className="mt-1 text-xs font-medium text-slate-600">{citation.heading}</p>
+                    {getCitationTarget(citation) ? (
+                      <button
+                        className="w-full text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-700"
+                        aria-label={`Open ${citation.filename}, page ${citation.page_number}, citation ${citation.index}`}
+                        onClick={() => void handleCitationClick(citation)}
+                        type="button"
+                      >
+                        <span className="text-sm font-semibold text-sky-900">
+                          [{citation.index}] {citation.filename} · Page {citation.page_number}
+                        </span>
+                        {citation.heading && (
+                          <span className="mt-1 block text-xs font-medium text-slate-600">{citation.heading}</span>
+                        )}
+                        <span className="mt-2 block border-l-2 border-slate-300 pl-3 text-sm leading-5 text-slate-700">
+                          {citation.quote}
+                        </span>
+                      </button>
+                    ) : (
+                      <>
+                        <p className="text-sm font-semibold text-slate-600">
+                          [{citation.index}] {citation.filename} · Page {citation.page_number}
+                        </p>
+                        <blockquote className="mt-2 border-l-2 border-slate-300 pl-3 text-sm leading-5 text-slate-700">
+                          {citation.quote}
+                        </blockquote>
+                        <p className="mt-2 text-xs text-amber-800">
+                          PDF unavailable: this citation has no valid document reference.
+                        </p>
+                      </>
                     )}
-                    <blockquote className="mt-2 border-l-2 border-slate-300 pl-3 text-sm leading-5 text-slate-700">
-                      {citation.quote}
-                    </blockquote>
                   </li>
                 ))}
               </ol>
+            </div>
+          )}
+          {selectedCitation && (
+            <div className="mt-5" aria-live="polite" ref={viewerRef}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h5 className="font-semibold text-slate-900">Cited PDF</h5>
+                <button
+                  className="rounded border border-slate-300 px-3 py-1.5 text-sm text-slate-700 hover:bg-white"
+                  onClick={() => {
+                    setSelectedCitation(null);
+                    setPdfError(null);
+                  }}
+                  type="button"
+                >
+                  Close PDF
+                </button>
+              </div>
+              {pdfLoading && (
+                <p className="mt-3 text-sm text-slate-600" role="status">Loading cited PDF…</p>
+              )}
+              {pdfError && (
+                <p className="mt-3 text-sm text-red-800" role="alert">{pdfError}</p>
+              )}
+              {loadedPdf && loadedPdf.documentId === selectedCitation.document_id && (
+                <WorkspacePdfViewer
+                  key={`${loadedPdf.documentId}:${selectedCitation.id}`}
+                  documentId={loadedPdf.documentId}
+                  highlightQuote={selectedCitation.quote}
+                  onError={handleViewerError}
+                  onPageChange={handleViewerPageChange}
+                  pdfBlob={loadedPdf.blob}
+                  targetPage={getCitationTarget(selectedCitation)?.pageNumber ?? null}
+                />
+              )}
             </div>
           )}
         </section>

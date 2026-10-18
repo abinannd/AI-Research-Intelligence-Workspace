@@ -1,0 +1,42 @@
+.page {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  margin-inline: auto;
+  overflow: hidden;
+  background: rgb(49, 156, 206);
+  box-shadow: 0 1px 4px rgba(69, 111, 209, 0.2);
+}
+
+.page canvas {
+  display: block;
+  max-width: 100%;
+}
+
+.textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  line-height: 1;
+  transform-origin: 0 0;
+  z-index: 1;
+  --min-font-size: 1;
+  --total-scale-factor: 1;
+}
+
+.textLayer :global(span),
+.textLayer :global(br) {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0 0;
+  user-select: text;
+}
+
+.textLayer :global(.highlight) {
+  margin: -1px;
+  padding: 1px;
+  border-radius: 3px;
+  background-color: rgba(84, 68, 5, 0.55);
+}
