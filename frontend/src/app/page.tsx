@@ -4,6 +4,7 @@ import { useEffect, useState, type FormEvent } from "react";
 
 import { api } from "@/lib/api";
 import { getAccessToken, setAccessToken } from "@/lib/token";
+import WorkspaceDocuments from "@/components/WorkspaceDocuments";
 import type { User, Workspace } from "@/lib/types";
 import { formatClock } from "@/lib/utils";
 
@@ -362,12 +363,18 @@ export default function Home() {
             ) : null}
 
             {selectedWorkspaceId && (
-              <p className="mt-4 rounded-lg bg-sky-50 px-4 py-3 text-sm text-sky-950" role="status">
-                Current workspace:{" "}
-                <span className="font-semibold">
-                  {workspaces.find((workspace) => workspace.id === selectedWorkspaceId)?.name}
-                </span>
-              </p>
+              <>
+                <p className="mt-4 rounded-lg bg-sky-50 px-4 py-3 text-sm text-sky-950" role="status">
+                  Current workspace:{" "}
+                  <span className="font-semibold">
+                    {workspaces.find((workspace) => workspace.id === selectedWorkspaceId)?.name}
+                  </span>
+                </p>
+                <WorkspaceDocuments
+                  key={selectedWorkspaceId}
+                  workspaceId={selectedWorkspaceId}
+                />
+              </>
             )}
           </section>
         </div>
