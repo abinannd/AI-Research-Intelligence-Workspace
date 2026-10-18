@@ -2,6 +2,8 @@ import io
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.api import documents as documents_api
@@ -30,6 +32,28 @@ class RecordingQueue:
         self.document_ids.append(document_id)
 
 
+class RecordingDeleteStorage:
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.deleted_keys: list[str] = []
+
+    def delete(self, key: str) -> None:
+        self.deleted_keys.append(key)
+        if self.fail:
+            raise RuntimeError("storage unavailable")
+
+
+class RecordingDeleteVectors:
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.deleted_documents: list[tuple[str, str]] = []
+
+    def delete_document(self, workspace_id: str, document_id: str) -> None:
+        self.deleted_documents.append((workspace_id, document_id))
+        if self.fail:
+            raise RuntimeError("vector store unavailable")
+
+
 def _configure_upload_dependencies(monkeypatch: pytest.MonkeyPatch, max_bytes: int):
     storage = RecordingStorage()
     queue = RecordingQueue()
@@ -49,6 +73,31 @@ def _create_authenticated_workspace(client: TestClient) -> tuple[str, dict[str, 
     workspace = client.post("/api/workspaces", json={"name": "Upload test"}, headers=headers)
     assert workspace.status_code == 200
     return workspace.json()["id"], headers
+
+
+def _create_document_for_delete(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    storage: RecordingDeleteStorage | None = None,
+    vectors: RecordingDeleteVectors | None = None,
+) -> tuple[str, str, dict[str, str], Document, RecordingDeleteStorage, RecordingDeleteVectors]:
+    workspace_id, headers = _create_authenticated_workspace(client)
+    storage = storage or RecordingDeleteStorage()
+    vectors = vectors or RecordingDeleteVectors()
+    monkeypatch.setattr(documents_api, "get_storage", lambda: storage)
+    monkeypatch.setattr(documents_api, "get_vectors", lambda: vectors)
+    doc = Document(
+        workspace_id=workspace_id,
+        filename="paper.pdf",
+        status="ready",
+        storage_key=f"{workspace_id}/document-id/paper.pdf",
+    )
+    db_session.add(doc)
+    db_session.commit()
+    db_session.refresh(doc)
+    return workspace_id, doc.id, headers, doc, storage, vectors
 
 
 class TrackingStream(io.BytesIO):
@@ -229,6 +278,127 @@ def test_upload_invalid_pdf_keeps_existing_validation_response(
     assert response.json()["detail"] == "File is not a valid PDF"
     assert storage.put_calls == []
     assert queue.document_ids == []
+
+
+def test_delete_document_cleans_external_resources_and_database_record(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_id, document_id, headers, doc, storage, vectors = _create_document_for_delete(
+        client, db_session, monkeypatch
+    )
+
+    response = client.delete(
+        f"/api/workspaces/{workspace_id}/documents/{document_id}",
+        headers=headers,
+    )
+
+    assert response.status_code == 204
+    assert db_session.get(Document, document_id) is None
+    assert vectors.deleted_documents == [(workspace_id, document_id)]
+    assert storage.deleted_keys == [doc.storage_key]
+
+
+def test_delete_document_storage_failure_retains_record_and_can_be_retried(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = RecordingDeleteStorage(fail=True)
+    vectors = RecordingDeleteVectors()
+    workspace_id, document_id, headers, doc, storage, vectors = _create_document_for_delete(
+        client,
+        db_session,
+        monkeypatch,
+        storage=storage,
+        vectors=vectors,
+    )
+    endpoint = f"/api/workspaces/{workspace_id}/documents/{document_id}"
+
+    failed = client.delete(endpoint, headers=headers)
+
+    assert failed.status_code == 503
+    assert "document file" in failed.json()["detail"]
+    assert db_session.get(Document, document_id) is not None
+    assert vectors.deleted_documents == [(workspace_id, document_id)]
+    assert storage.deleted_keys == [doc.storage_key]
+
+    storage.fail = False
+    retried = client.delete(endpoint, headers=headers)
+
+    assert retried.status_code == 204
+    assert db_session.get(Document, document_id) is None
+    assert vectors.deleted_documents == [(workspace_id, document_id)] * 2
+    assert storage.deleted_keys == [doc.storage_key] * 2
+
+
+def test_delete_document_vector_failure_retains_record_and_skips_storage(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = RecordingDeleteStorage()
+    vectors = RecordingDeleteVectors(fail=True)
+    workspace_id, document_id, headers, _, storage, vectors = _create_document_for_delete(
+        client,
+        db_session,
+        monkeypatch,
+        storage=storage,
+        vectors=vectors,
+    )
+
+    response = client.delete(
+        f"/api/workspaces/{workspace_id}/documents/{document_id}",
+        headers=headers,
+    )
+
+    assert response.status_code == 503
+    assert "document vectors" in response.json()["detail"]
+    assert db_session.get(Document, document_id) is not None
+    assert vectors.deleted_documents == [(workspace_id, document_id)]
+    assert storage.deleted_keys == []
+
+
+def test_delete_document_commit_failure_rolls_back_and_keeps_session_usable(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_id, document_id, headers, _, storage, vectors = _create_document_for_delete(
+        client, db_session, monkeypatch
+    )
+    engine = db_session.get_bind()
+
+    def fail_document_delete(
+        connection,
+        cursor,
+        statement: str,
+        parameters,
+        context,
+        executemany,
+    ) -> None:
+        if statement.lstrip().upper().startswith("DELETE FROM DOCUMENTS"):
+            raise OperationalError(statement, parameters, RuntimeError("simulated commit failure"))
+
+    event.listen(engine, "before_cursor_execute", fail_document_delete)
+    try:
+        with TestClient(client.app, raise_server_exceptions=False) as error_handling_client:
+            response = error_handling_client.delete(
+                f"/api/workspaces/{workspace_id}/documents/{document_id}",
+                headers=headers,
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_document_delete)
+
+    assert response.status_code == 500
+    assert vectors.deleted_documents == [(workspace_id, document_id)]
+    assert storage.deleted_keys == [f"{workspace_id}/{document_id}/paper.pdf"]
+
+    db_session.rollback()
+    assert db_session.is_active
+    assert db_session.get(Document, document_id) is not None
+    assert db_session.query(Document).filter(Document.id == document_id).count() == 1
 
 
 def test_scanned_pdf_flagging(pdf_generator) -> None:

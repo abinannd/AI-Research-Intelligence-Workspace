@@ -93,12 +93,18 @@ def delete_document(
 ) -> None:
     doc = get_owned_document(db, user, workspace_id, document_id)
     try:
-        storage.delete(doc.storage_key)
-    except Exception:
-        pass
-    try:
         vectors.delete_document(workspace_id, document_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not remove document vectors; deletion can be retried.",
+        ) from exc
+    try:
+        storage.delete(doc.storage_key)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not remove the document file; deletion can be retried.",
+        ) from exc
     db.delete(doc)
     db.commit()
