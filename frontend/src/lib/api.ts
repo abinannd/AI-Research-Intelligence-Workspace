@@ -165,10 +165,17 @@ export const api = {
     return response.blob();
   },
 
-  ask(workspaceId: string, payload: { question: string; document_ids?: string[] }) {
-    return request<AskResponse>(`/api/workspaces/${workspaceId}/ask`, {
+  ask(workspaceId: string, payload: { question: string; document_ids?: string[] }, timeoutMs?: number) {
+    const controller = new AbortController();
+    const timeoutId = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+    const promise = request<AskResponse>(`/api/workspaces/${workspaceId}/ask`, {
       method: "POST",
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
+    if (timeoutId !== undefined) {
+      promise.finally(() => clearTimeout(timeoutId));
+    }
+    return promise;
   },
 };

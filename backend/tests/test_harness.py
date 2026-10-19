@@ -8,12 +8,15 @@ from sqlalchemy.orm import Session
 
 from app.api import documents as documents_api
 from app.config import Settings
+from app.citations.llm import HuggingFaceLLMService, build_llm, LLMService
+from app.citations.qa import answer_question
 from app.citations.validator import validate_model_output
 from app.models import Document, User, Workspace
 from app.parsing.chunking import chunk_pages
 from app.parsing.pdf import PageText, PdfValidationError, parse_pdf, validate_pdf_bytes
 from app.retrieval.embeddings import HashEmbeddingService
 from app.retrieval.qdrant_store import MemoryVectorStore, RetrievedChunk
+from app.retrieval.retriever import Retriever
 
 
 class RecordingStorage:
@@ -670,3 +673,133 @@ def test_citation_validator_grounding() -> None:
     assert abstained is True
     assert reason == "Insufficient evidence in context"
     assert answer == "The sources do not answer this."
+
+
+def test_huggingface_llm_accepts_max_time_parameter() -> None:
+    """Verifies HuggingFaceLLMService stores the generation timeout."""
+    llm = HuggingFaceLLMService("test-model", max_time=60.0)
+    assert llm.max_time == 60.0
+    assert llm.model_version == "test-model"
+
+
+def test_build_llm_passes_timeout_from_settings() -> None:
+    """Verifies build_llm wires llm_generation_timeout_seconds into max_time."""
+    settings = Settings(
+        llm_backend="hf",
+        llm_model="test-model",
+        llm_generation_timeout_seconds=90,
+    )
+    llm = build_llm(settings)
+    assert isinstance(llm, HuggingFaceLLMService)
+    assert llm.max_time == 90
+
+
+def test_build_llm_returns_stub_for_stub_backend() -> None:
+    """Verifies non-HF backends are unaffected by the timeout setting."""
+    settings = Settings(
+        llm_backend="stub",
+        llm_generation_timeout_seconds=90,
+    )
+    llm = build_llm(settings)
+    assert not isinstance(llm, HuggingFaceLLMService)
+    assert llm.model_version == "stub-llm"
+
+
+class InvalidJsonLLM(LLMService):
+    """Mock LLM that returns unparseable output, simulating a truncated generation."""
+
+    @property
+    def model_version(self) -> str:
+        return "invalid-json-llm"
+
+    def complete(self, system: str, user: str) -> str:
+        return "{ incomplete json"
+
+
+def test_answer_question_abstains_on_invalid_llm_output_no_citations(db_session: Session) -> None:
+    """Verifies that invalid LLM output (e.g. truncated by max_time) yields abstain with no citations."""
+    from app.security import hash_password
+
+    user = User(email="timeout-test@local", password_hash=hash_password("Password123!"))
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    settings = Settings(
+        llm_backend="hf",
+        llm_model="test-model",
+        llm_generation_timeout_seconds=60,
+        retrieval_top_k=8,
+    )
+
+    retriever = Retriever(
+        HashEmbeddingService(dim=384),
+        MemoryVectorStore(dim=384),
+        top_k=8,
+    )
+    retriever.store.upsert([{
+        "id": "chunk-1",
+        "vector": [0.1] * 384,
+        "payload": {
+            "workspace_id": "ws-1",
+            "document_id": "doc-1",
+            "chunk_id": "chunk-1",
+            "filename": "test.pdf",
+            "page_number": 1,
+            "text": "Test content for retrieval.",
+        },
+    }])
+
+    query = answer_question(
+        db_session,
+        workspace_id="ws-1",
+        user_id=user.id,
+        question="What is the answer?",
+        document_ids=None,
+        retriever=retriever,
+        llm=InvalidJsonLLM(),
+        settings=settings,
+    )
+
+    assert query.abstained is True
+    assert len(query.citations) == 0
+    assert len(query.claims) == 0
+    assert "synthesizer" in query.abstain_reason or "json" in query.abstain_reason.lower()
+
+
+def test_ask_endpoint_stub_llm_compatibility(
+    client: TestClient,
+    auth_user: tuple[User, str, dict[str, str]],
+    test_workspace: Workspace,
+    db_session: Session,
+) -> None:
+    """Verifies the Ask endpoint still works with the stub LLM backend."""
+    _, _, headers = auth_user
+
+    doc = Document(
+        workspace_id=test_workspace.id,
+        filename="paper.pdf",
+        status="ready",
+        storage_key=f"{test_workspace.id}/paper.pdf",
+    )
+    db_session.add(doc)
+    db_session.commit()
+    db_session.refresh(doc)
+
+    response = client.post(
+        f"/api/workspaces/{test_workspace.id}/ask",
+        headers=headers,
+        json={"question": "What does the document say?", "document_ids": [doc.id]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "abstained" in body
+    assert "answer" in body
+    assert "claims" in body
+    assert "citations" in body
+    assert "latency_ms" in body
+    assert body["latency_ms"] >= 0
+    assert body["model_version"] == "stub-llm"
+    assert isinstance(body["claims"], list)
+    assert isinstance(body["citations"], list)

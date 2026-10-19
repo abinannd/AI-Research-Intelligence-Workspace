@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     prompt_version: str = "cited-qa-v1"
     retrieval_version: str = "bge-small-top8-v1"
     retrieval_top_k: int = 8
+    llm_generation_timeout_seconds: int = 120
 
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

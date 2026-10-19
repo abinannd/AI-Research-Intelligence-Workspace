@@ -29,8 +29,12 @@ export default function WorkspaceAsk({
   const [loadedPdf, setLoadedPdf] = useState<{ documentId: string; blob: Blob } | null>(null);
   const [pdfLoading, setPdfLoading] = useState(false);
   const [pdfError, setPdfError] = useState<string | null>(null);
-  const pdfRequestId = useRef(0);
-  const viewerRef = useRef<HTMLDivElement>(null);
+const pdfRequestId = useRef(0);
+const viewerRef = useRef<HTMLDivElement>(null);
+
+// Client-side ask timeout, kept longer than the server-side generation deadline
+// so the server bounds generation first and the client timeout is a safety net.
+const ASK_TIMEOUT_MS = 150_000;
 
   const payload = createAskPayload(question, readyDocumentIds);
   const disabled = documentsLoading || documentsError || pending || payload === null;
@@ -95,12 +99,15 @@ export default function WorkspaceAsk({
     setResponse(null);
     setPending(true);
     try {
-      setResponse(await api.ask(workspaceId, requestPayload));
+      setResponse(await api.ask(workspaceId, requestPayload, ASK_TIMEOUT_MS));
     } catch (requestError) {
+      const isAbort = requestError instanceof Error && requestError.name === "AbortError";
       if (requestError instanceof ApiError && requestError.status === 401) {
         setError("Your session has expired. Please sign in again.");
       } else if (requestError instanceof ApiError && requestError.status === 403) {
         setError("You are not authorized to ask questions in this workspace.");
+      } else if (isAbort) {
+        setError("The request timed out. The model is still thinking on the server; please try again.");
       } else {
         setError(
           requestError instanceof Error
